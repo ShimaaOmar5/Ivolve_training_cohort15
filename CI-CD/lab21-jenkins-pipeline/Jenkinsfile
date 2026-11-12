@@ -1,0 +1,197 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64'
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        PATH = '/usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/bin:/usr/bin:/bin'
+        TRIVY_CACHE_DIR = '/var/lib/jenkins/.cache/trivy'
+    }
+
+    stages {
+
+        stage('1. Clone Source Code') {
+            steps {
+                deleteDir()
+
+                sh '''
+                    git clone --depth 1 \
+                    https://github.com/Ibrahim-Adel15/DemoApp.git app
+                '''
+            }
+        }
+
+        stage('2. Build Application') {
+            steps {
+                dir('app') {
+                    sh '''
+                        echo "Building Spring Boot application..."
+                        mvn clean package
+                        test -f target/demo-0.0.1-SNAPSHOT.jar
+                    '''
+                }
+            }
+        }
+
+        stage('3. Build Docker Image') {
+            steps {
+                script {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'dockerhub-credentials',
+                            usernameVariable: 'DH_USER',
+                            passwordVariable: 'DH_TOKEN'
+                        )
+                    ]) {
+                        env.DOCKERHUB_USER = DH_USER
+                        env.IMAGE = "${DH_USER}/demoapp:${BUILD_NUMBER}"
+                    }
+                }
+
+                dir('app') {
+                    sh '''
+                        docker build -t "$IMAGE" .
+                        docker image inspect "$IMAGE"
+                    '''
+                }
+            }
+        }
+
+        stage('4. Scan Docker Image') {
+            steps {
+                sh '''
+                    echo "Scanning Docker image with Trivy..."
+
+                    trivy image \
+                        --timeout 20m \
+                        --skip-version-check \
+                        --format json \
+                        --output trivy-report.json \
+                        "$IMAGE"
+
+                    echo "Reporting HIGH and CRITICAL vulnerabilities..."
+
+                    trivy image \
+                        --timeout 20m \
+                        --skip-version-check \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        "$IMAGE"
+                '''
+            }
+        }
+
+        stage('5. Push Image to DockerHub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+
+                        echo "$DH_TOKEN" | docker login \
+                            --username "$DH_USER" \
+                            --password-stdin
+
+                        docker push "$IMAGE"
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('6. Delete Local Image') {
+            steps {
+                sh '''
+                    docker rmi "$IMAGE"
+                '''
+            }
+        }
+
+        stage('7. Update Image in Deployment File') {
+            steps {
+                script {
+                    writeFile(
+                        file: 'deployment.yaml',
+                        text: """
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demoapp-lab21
+  namespace: ivolve
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demoapp-lab21
+  template:
+    metadata:
+      labels:
+        app: demoapp-lab21
+    spec:
+      containers:
+        - name: demoapp
+          image: ${env.IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+"""
+                    )
+                }
+
+                sh '''
+                    echo "Updated Kubernetes deployment image:"
+                    grep "image:" deployment.yaml
+                '''
+            }
+        }
+
+        stage('8. Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    kubectl apply -f deployment.yaml \
+                        --kubeconfig="$KUBECONFIG"
+
+                    kubectl rollout status \
+                        deployment/demoapp-lab21 \
+                        -n ivolve \
+                        --timeout=180s \
+                        --kubeconfig="$KUBECONFIG"
+
+                    kubectl get deployments,pods \
+                        -n ivolve \
+                        --kubeconfig="$KUBECONFIG"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'trivy-report.json,deployment.yaml',
+                allowEmptyArchive: true
+            )
+
+            echo 'Pipeline execution finished.'
+        }
+
+        success {
+            echo 'SUCCESS: Application deployed to Kubernetes.'
+        }
+
+        failure {
+            echo 'FAILURE: Check the Jenkins console output.'
+        }
+    }
+}
