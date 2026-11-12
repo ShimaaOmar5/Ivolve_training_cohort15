@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demoapp-lab21
+  namespace: ivolve
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demoapp-lab21
+  template:
+    metadata:
+      labels:
+        app: demoapp-lab21
+    spec:
+      containers:
+        - name: demoapp
+          image: YOUR_DOCKERHUB_USERNAME/demoapp:YOUR_IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
